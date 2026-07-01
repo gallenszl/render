@@ -473,17 +473,21 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
     """
     os.makedirs(output_dir, exist_ok=True)
     # WASH BUG FIX: toggle use_persistent_data OFF here to force Cycles to
-    # release BVH/texture cache from the PREVIOUS object. Setting to False
-    # only for this one line (then back to True in init_render before render
-    # loop) prevents stochastic texture wash where prior obj's textures leak
-    # into current render (~6.4% of meshes affected in persistent mode).
-    # Cost: one extra BVH rebuild per obj (~0.5s), avoids per-view kernel
-    # reload (which would cost 30x more).
-    bpy.context.scene.render.use_persistent_data = False
-    init_scene()
-    load_object(mesh_path)
-    # Re-enable persistent for the 40 views of THIS obj (share BVH → fast).
-    bpy.context.scene.render.use_persistent_data = True
+    # release BVH/texture cache from the PREVIOUS object.
+    #
+    # Only needed on Blender <= 5.1. Blender 5.2 introduces a new Cycles texture
+    # cache system that fundamentally replaces the leaky persistent_data mechanism,
+    # so the toggle is unnecessary (and costs ~11s per obj we no longer need).
+    # Verified by wash_persistent_test on all 3 wash meshes: 5.2 gives σ=0 across
+    # 100 iterations without any toggle; 4.2/4.5/5.1 all still leak.
+    if bpy.app.version < (5, 2, 0):
+        bpy.context.scene.render.use_persistent_data = False
+        init_scene()
+        load_object(mesh_path)
+        bpy.context.scene.render.use_persistent_data = True
+    else:
+        init_scene()
+        load_object(mesh_path)
 
     # Layer 1a: degenerate-mesh gate
     try:
