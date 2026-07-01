@@ -128,50 +128,61 @@ def init_nodes(save_depth=True, base_path=""):
 
     render_layers = nodes.new("CompositorNodeRLayers")
 
-    # Blender 5.2 rewrote CompositorNodeOutputFile API completely:
-    #   base_path → directory (renamed)
-    #   file_slots.new() → file_output_items.new(socket_type='IMAGE', name=...)
-    # This is a much bigger porting task. For upgrade evaluation Phase C we
-    # only need RGB + transforms.json to measure wash fix + fg alignment,
-    # so skip depth output on 5.2+ for now. Depth support will be re-added
-    # once 5.2 upgrade is confirmed as the path forward.
-    if bpy.app.version >= (5, 2, 0) and save_depth:
-        print("[init_nodes] SKIP depth output on Blender 5.2+ (API rewrite pending port)", flush=True)
+    if not save_depth:
         return outputs, spec_nodes
 
-    if save_depth:
-        depth_file_output = nodes.new("CompositorNodeOutputFile")
+    is_v52 = bpy.app.version >= (5, 2, 0)
+
+    # 5.2 rewrote CompositorNodeOutputFile:
+    #   `base_path` → `directory`; `file_slots` → `file_output_items`
+    #   `CompositorNodeMath` removed → use `ShaderNodeMath` (compositor accepts it now)
+    #   `CompositorNodeMapRange` removed → always use Subtract + Divide chain on 5.2+
+    depth_file_output = nodes.new("CompositorNodeOutputFile")
+    if is_v52:
+        depth_file_output.directory = base_path
+        # Clear default item + add typed FLOAT socket for depth
+        depth_file_output.file_output_items.clear()
+        itm = depth_file_output.file_output_items.new('FLOAT', 'depth')
+        itm.override_node_format = True
+        itm.format.file_format = "PNG"
+        itm.format.color_depth = "16"
+        itm.format.color_mode = "BW"
+    else:
         depth_file_output.base_path = base_path
         depth_file_output.file_slots[0].use_node_format = True
         depth_file_output.format.file_format = "PNG"
         depth_file_output.format.color_depth = "16"
         depth_file_output.format.color_mode = "BW"
-        # Blender 5.2 removed CompositorNodeMapRange. Emulate with two Math
-        # nodes: (depth - from_min) / (from_max - from_min). Both 4.5 and 4.2
-        # still support MapRange as a single node.
-        if hasattr(bpy.types, 'CompositorNodeMapRange'):
-            depth_map = nodes.new(type="CompositorNodeMapRange")
-            depth_map.inputs[1].default_value = 0
-            depth_map.inputs[2].default_value = 10
-            depth_map.inputs[3].default_value = 0
-            depth_map.inputs[4].default_value = 1
-            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
-            links.new(depth_map.outputs[0], depth_file_output.inputs[0])
-        else:
-            # 5.2 fallback: subtract + divide
-            depth_map = nodes.new(type="CompositorNodeMath")
-            depth_map.operation = 'SUBTRACT'
-            depth_map.inputs[1].default_value = 0  # from_min
-            depth_div = nodes.new(type="CompositorNodeMath")
-            depth_div.operation = 'DIVIDE'
-            depth_div.inputs[1].default_value = 10  # from_max - from_min
-            depth_div.use_clamp = True
-            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
-            links.new(depth_map.outputs[0], depth_div.inputs[0])
-            links.new(depth_div.outputs[0], depth_file_output.inputs[0])
-            spec_nodes["depth_div"] = depth_div  # so per-frame update can reach it
-        outputs["depth"] = depth_file_output
-        spec_nodes["depth_map"] = depth_map
+
+    # Math node class name differs: 5.2 uses ShaderNodeMath; earlier ver uses CompositorNodeMath.
+    # MapRange node was removed in 5.2 — always fall back to two-node chain on 5.2+.
+    math_node_type = "ShaderNodeMath" if is_v52 else "CompositorNodeMath"
+
+    if hasattr(bpy.types, 'CompositorNodeMapRange') and not is_v52:
+        depth_map = nodes.new(type="CompositorNodeMapRange")
+        depth_map.inputs[1].default_value = 0
+        depth_map.inputs[2].default_value = 10
+        depth_map.inputs[3].default_value = 0
+        depth_map.inputs[4].default_value = 1
+        links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+        links.new(depth_map.outputs[0], depth_file_output.inputs[0])
+    else:
+        # (depth - from_min) / (from_max - from_min), clamped
+        depth_map = nodes.new(type=math_node_type)
+        depth_map.operation = 'SUBTRACT'
+        depth_map.inputs[1].default_value = 0
+        depth_div = nodes.new(type=math_node_type)
+        depth_div.operation = 'DIVIDE'
+        depth_div.inputs[1].default_value = 10
+        depth_div.use_clamp = True
+        links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+        links.new(depth_map.outputs[0], depth_div.inputs[0])
+        links.new(depth_div.outputs[0], depth_file_output.inputs[0])
+        spec_nodes["depth_div"] = depth_div
+
+    outputs["depth"] = depth_file_output
+    spec_nodes["depth_map"] = depth_map
+    spec_nodes["depth_is_v52"] = is_v52   # used to route per-frame filename update
     return outputs, spec_nodes
 
 
@@ -645,9 +656,14 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
         # Output paths
         # RGB: absolute path works for scene.render.filepath
         bpy.context.scene.render.filepath = os.path.join(output_dir, f"{i:03d}.png")
-        # Depth: RELATIVE filename — gets joined to depth_file_output.base_path (=output_dir)
+        # Depth: RELATIVE filename — gets joined to output node's directory (=output_dir)
+        # 4.2/4.5: use file_slots[0].path
+        # 5.2+:    use n.file_name (typed sockets, no file_slots)
         for name, out in outputs.items():
-            out.file_slots[0].path = f"{i:03d}_{name}"
+            if spec_nodes.get("depth_is_v52"):
+                out.file_name = f"{i:03d}_{name}"
+            else:
+                out.file_slots[0].path = f"{i:03d}_{name}"
 
         bpy.context.view_layer.update()
         t_a1 = time.perf_counter()
