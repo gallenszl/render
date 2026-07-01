@@ -133,57 +133,90 @@ def init_nodes(save_depth=True, base_path=""):
 
     is_v52 = bpy.app.version >= (5, 2, 0)
 
-    # 5.2 rewrote CompositorNodeOutputFile:
-    #   `base_path` → `directory`; `file_slots` → `file_output_items`
-    #   `CompositorNodeMath` removed → use `ShaderNodeMath` (compositor accepts it now)
-    #   `CompositorNodeMapRange` removed → always use Subtract + Divide chain on 5.2+
     depth_file_output = nodes.new("CompositorNodeOutputFile")
+
     if is_v52:
+        # 5.2 API changes:
+        #   `base_path` → `directory`
+        #   `file_slots` → `file_output_items` (typed sockets)
+        #   `CompositorNodeMath/MapRange` removed
+        #
+        # Additional 5.2 beta BUG: `itm.override_node_format` is silently ignored.
+        # Attempting itm.format.file_format = "PNG" is accepted at API level but
+        # the actual saved file is still OPEN_EXR_MULTILAYER (.exr). So on 5.2 we
+        # let it save as EXR (unnormalized raw depth in scene units) and post-
+        # process each EXR → 16-bit BW PNG in the per-view loop below (see the
+        # `depth_5.2_post_process` helper called after bpy.ops.render.render()).
         depth_file_output.directory = base_path
-        # Clear default item + add typed FLOAT socket for depth
         depth_file_output.file_output_items.clear()
         itm = depth_file_output.file_output_items.new('FLOAT', 'depth')
-        itm.override_node_format = True
-        itm.format.file_format = "PNG"
-        itm.format.color_depth = "16"
-        itm.format.color_mode = "BW"
+        links.new(render_layers.outputs["Depth"], depth_file_output.inputs[0])
+        # No MapRange chain: raw depth goes into EXR; normalization deferred to Python.
     else:
+        # 4.2 / 4.5 path
         depth_file_output.base_path = base_path
         depth_file_output.file_slots[0].use_node_format = True
         depth_file_output.format.file_format = "PNG"
         depth_file_output.format.color_depth = "16"
         depth_file_output.format.color_mode = "BW"
-
-    # Math node class name differs: 5.2 uses ShaderNodeMath; earlier ver uses CompositorNodeMath.
-    # MapRange node was removed in 5.2 — always fall back to two-node chain on 5.2+.
-    math_node_type = "ShaderNodeMath" if is_v52 else "CompositorNodeMath"
-
-    if hasattr(bpy.types, 'CompositorNodeMapRange') and not is_v52:
-        depth_map = nodes.new(type="CompositorNodeMapRange")
-        depth_map.inputs[1].default_value = 0
-        depth_map.inputs[2].default_value = 10
-        depth_map.inputs[3].default_value = 0
-        depth_map.inputs[4].default_value = 1
-        links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
-        links.new(depth_map.outputs[0], depth_file_output.inputs[0])
-    else:
-        # (depth - from_min) / (from_max - from_min), clamped
-        depth_map = nodes.new(type=math_node_type)
-        depth_map.operation = 'SUBTRACT'
-        depth_map.inputs[1].default_value = 0
-        depth_div = nodes.new(type=math_node_type)
-        depth_div.operation = 'DIVIDE'
-        depth_div.inputs[1].default_value = 10
-        depth_div.use_clamp = True
-        links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
-        links.new(depth_map.outputs[0], depth_div.inputs[0])
-        links.new(depth_div.outputs[0], depth_file_output.inputs[0])
-        spec_nodes["depth_div"] = depth_div
+        if hasattr(bpy.types, 'CompositorNodeMapRange'):
+            depth_map = nodes.new(type="CompositorNodeMapRange")
+            depth_map.inputs[1].default_value = 0
+            depth_map.inputs[2].default_value = 10
+            depth_map.inputs[3].default_value = 0
+            depth_map.inputs[4].default_value = 1
+            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+            links.new(depth_map.outputs[0], depth_file_output.inputs[0])
+            spec_nodes["depth_map"] = depth_map
+        else:
+            # Blender 4.x may not have MapRange in some 4.5+ builds — fallback
+            depth_map = nodes.new(type="CompositorNodeMath")
+            depth_map.operation = 'SUBTRACT'
+            depth_map.inputs[1].default_value = 0
+            depth_div = nodes.new(type="CompositorNodeMath")
+            depth_div.operation = 'DIVIDE'
+            depth_div.inputs[1].default_value = 10
+            depth_div.use_clamp = True
+            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+            links.new(depth_map.outputs[0], depth_div.inputs[0])
+            links.new(depth_div.outputs[0], depth_file_output.inputs[0])
+            spec_nodes["depth_map"] = depth_map
+            spec_nodes["depth_div"] = depth_div
 
     outputs["depth"] = depth_file_output
-    spec_nodes["depth_map"] = depth_map
-    spec_nodes["depth_is_v52"] = is_v52   # used to route per-frame filename update
+    spec_nodes["depth_is_v52"] = is_v52
     return outputs, spec_nodes
+
+
+def _depth_exr_to_16bit_png(exr_path: str, png_path: str, d_min: float, d_max: float):
+    """5.2 workaround: normalize raw depth EXR → 16-bit BW PNG.
+
+    Blender 5.2 saves OutputFile as multilayer EXR with channels named e.g.
+    `depth.R/G/B/A` regardless of `override_node_format` setting. Take one
+    channel (R), apply `(d - d_min) / (d_max - d_min)`, clamp to [0,1], scale
+    to uint16, write as 16-bit BW PNG.
+    """
+    import OpenEXR, Imath
+    from PIL import Image
+    exr = OpenEXR.InputFile(exr_path)
+    hdr = exr.header()
+    dw = hdr['dataWindow']
+    w = dw.max.x - dw.min.x + 1
+    h = dw.max.y - dw.min.y + 1
+    ch_names = list(hdr['channels'].keys())
+    # Prefer '<layer>.R' channel; fall back to first channel available
+    r_ch = next((c for c in ch_names if c.endswith('.R') or c == 'R'), ch_names[0])
+    buf = exr.channel(r_ch, Imath.PixelType(Imath.PixelType.FLOAT))
+    exr.close()
+    arr = np.frombuffer(buf, dtype=np.float32).reshape((h, w))
+    normed = (arr - d_min) / max(d_max - d_min, 1e-9)
+    normed = np.clip(normed, 0.0, 1.0)
+    u16 = (normed * 65535.0).astype(np.uint16)
+    Image.fromarray(u16, mode='I;16').save(png_path)
+    try:
+        os.remove(exr_path)
+    except OSError:
+        pass
 
 
 def init_scene():
@@ -671,6 +704,14 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
         # ---- Phase B: render (Cycles + denoise + compositor file writes)
         bpy.ops.render.render(write_still=True)
         t_b1 = time.perf_counter()
+
+        # 5.2 depth post-process: convert raw EXR → 16-bit BW PNG
+        if spec_nodes.get("depth_is_v52") and outputs.get("depth"):
+            # Blender's OutputFile appends "0001" (frame number) to file_name
+            exr_path = os.path.join(output_dir, f"{i:03d}_depth0001.exr")
+            png_path = os.path.join(output_dir, f"{i:03d}_depth.png")
+            if os.path.exists(exr_path):
+                _depth_exr_to_16bit_png(exr_path, png_path, d_min, d_max)
         per_view_times.append(t_b1 - t_a1)
 
         # Layer 1c: post-render fg ratio check on first view only.
