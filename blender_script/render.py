@@ -63,7 +63,13 @@ def init_render(engine="CYCLES", resolution=512, device="GPU", samples=128,
     bpy.context.scene.render.image_settings.file_format = "PNG"
     bpy.context.scene.render.image_settings.color_mode = "RGBA"
     bpy.context.scene.render.film_transparent = True
-    bpy.context.scene.render.use_persistent_data = True  # share BVH across frames
+    # WASH BUG FIX: use_persistent_data=True + init_scene per-obj cleanup causes
+    # Cycles BVH/texture cache to leak across render() calls, producing stochastic
+    # texture wash (~6.4% of meshes rendered gray/wrong-colored in persistent mode).
+    # Verified via wash_persistent_test.py: same mesh renders different colors across
+    # iterations with True; deterministic correct color with False. Set False to
+    # force clean state per render (small perf cost — BVH rebuild dominated by ray-trace).
+    bpy.context.scene.render.use_persistent_data = False
 
     bpy.context.scene.cycles.samples = samples if not geo_mode else 1
     bpy.context.scene.cycles.filter_type = "BOX"
