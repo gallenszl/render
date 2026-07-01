@@ -105,11 +105,24 @@ def init_nodes(save_depth=True, base_path=""):
     """
     outputs = {}
     spec_nodes = {}
-    bpy.context.scene.use_nodes = True
-    bpy.context.scene.view_layers[0].use_pass_z = save_depth
+    scene = bpy.context.scene
+    scene.view_layers[0].use_pass_z = save_depth
 
-    nodes = bpy.context.scene.node_tree.nodes
-    links = bpy.context.scene.node_tree.links
+    # Blender 5.2+ replaced `scene.node_tree` (auto-created on `use_nodes=True`)
+    # with an explicit `scene.compositing_node_group` NodeGroup. Detect + adapt.
+    if hasattr(scene, 'compositing_node_group'):
+        # 5.2+ path
+        ng = scene.compositing_node_group
+        if ng is None:
+            ng = bpy.data.node_groups.new(name='Compositor', type='CompositorNodeTree')
+            scene.compositing_node_group = ng
+        nodes = ng.nodes
+        links = ng.links
+    else:
+        # 4.2/4.5 path
+        scene.use_nodes = True
+        nodes = scene.node_tree.nodes
+        links = scene.node_tree.links
     for n in nodes:
         nodes.remove(n)
 
