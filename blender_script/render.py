@@ -748,6 +748,10 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
 
         # ---- Phase C: post-process (rename _depth0001 → _depth, optional overlay)
         for name, out in outputs.items():
+            # 5.2 depth path already handled by _depth_exr_to_16bit_png above
+            # (writes final `{i:03d}_{name}.png` directly, no rename needed).
+            if spec_nodes.get("depth_is_v52"):
+                continue
             ext = EXT[out.format.file_format]
             target = os.path.join(output_dir, f"{i:03d}_{name}.{ext}")
             matches = sorted(
