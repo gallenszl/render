@@ -128,6 +128,17 @@ def init_nodes(save_depth=True, base_path=""):
 
     render_layers = nodes.new("CompositorNodeRLayers")
 
+    # Blender 5.2 rewrote CompositorNodeOutputFile API completely:
+    #   base_path → directory (renamed)
+    #   file_slots.new() → file_output_items.new(socket_type='IMAGE', name=...)
+    # This is a much bigger porting task. For upgrade evaluation Phase C we
+    # only need RGB + transforms.json to measure wash fix + fg alignment,
+    # so skip depth output on 5.2+ for now. Depth support will be re-added
+    # once 5.2 upgrade is confirmed as the path forward.
+    if bpy.app.version >= (5, 2, 0) and save_depth:
+        print("[init_nodes] SKIP depth output on Blender 5.2+ (API rewrite pending port)", flush=True)
+        return outputs, spec_nodes
+
     if save_depth:
         depth_file_output = nodes.new("CompositorNodeOutputFile")
         depth_file_output.base_path = base_path
@@ -618,16 +629,18 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
 
         # Depth MapRange — depth bounds per frame (TRELLIS formula adapted to per-view radius)
         # 4.2/4.5 use single MapRange node; 5.2 uses (Subtract + Divide) two-node emulation.
+        # Blender 5.2+ has depth output disabled entirely (see init_nodes), skip block.
         d_min = radius - 0.5 * math.sqrt(3)
         d_max = radius + 0.5 * math.sqrt(3)
-        if "depth_div" in spec_nodes:
-            # 5.2 path: from_min goes to Subtract input[1], scale goes to Divide input[1]
-            spec_nodes["depth_map"].inputs[1].default_value = d_min
-            spec_nodes["depth_div"].inputs[1].default_value = (d_max - d_min)
-        else:
-            # 4.2/4.5 path: MapRange has 4 numeric inputs (from_min/max, to_min/max)
-            spec_nodes["depth_map"].inputs[1].default_value = d_min
-            spec_nodes["depth_map"].inputs[2].default_value = d_max
+        if "depth_map" in spec_nodes:
+            if "depth_div" in spec_nodes:
+                # 5.2 planned path (not currently taken): Subtract + Divide
+                spec_nodes["depth_map"].inputs[1].default_value = d_min
+                spec_nodes["depth_div"].inputs[1].default_value = (d_max - d_min)
+            else:
+                # 4.2/4.5 path: MapRange has 4 numeric inputs (from_min/max, to_min/max)
+                spec_nodes["depth_map"].inputs[1].default_value = d_min
+                spec_nodes["depth_map"].inputs[2].default_value = d_max
 
         # Output paths
         # RGB: absolute path works for scene.render.filepath
