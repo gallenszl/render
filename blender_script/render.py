@@ -707,11 +707,14 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
 
         # 5.2 depth post-process: convert raw EXR → 16-bit BW PNG
         if spec_nodes.get("depth_is_v52") and outputs.get("depth"):
-            # Blender's OutputFile appends "0001" (frame number) to file_name
-            exr_path = os.path.join(output_dir, f"{i:03d}_depth0001.exr")
+            # Blender 5.2 uses `n.file_name` verbatim (no frame suffix). We set
+            # it to `{i:03d}_depth` above so the saved file is `<i>_depth.exr`.
+            exr_path = os.path.join(output_dir, f"{i:03d}_depth.exr")
             png_path = os.path.join(output_dir, f"{i:03d}_depth.png")
             if os.path.exists(exr_path):
                 _depth_exr_to_16bit_png(exr_path, png_path, d_min, d_max)
+            else:
+                print(f"[WARN 5.2 depth] EXR not found: {exr_path}", flush=True)
         per_view_times.append(t_b1 - t_a1)
 
         # Layer 1c: post-render fg ratio check on first view only.
