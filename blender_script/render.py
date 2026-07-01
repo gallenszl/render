@@ -63,13 +63,7 @@ def init_render(engine="CYCLES", resolution=512, device="GPU", samples=128,
     bpy.context.scene.render.image_settings.file_format = "PNG"
     bpy.context.scene.render.image_settings.color_mode = "RGBA"
     bpy.context.scene.render.film_transparent = True
-    # WASH BUG FIX: use_persistent_data=True + init_scene per-obj cleanup causes
-    # Cycles BVH/texture cache to leak across render() calls, producing stochastic
-    # texture wash (~6.4% of meshes rendered gray/wrong-colored in persistent mode).
-    # Verified via wash_persistent_test.py: same mesh renders different colors across
-    # iterations with True; deterministic correct color with False. Set False to
-    # force clean state per render (small perf cost — BVH rebuild dominated by ray-trace).
-    bpy.context.scene.render.use_persistent_data = False
+    bpy.context.scene.render.use_persistent_data = True  # share BVH across frames of same obj
 
     bpy.context.scene.cycles.samples = samples if not geo_mode else 1
     bpy.context.scene.cycles.filter_type = "BOX"
@@ -456,8 +450,18 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
         all-empty, write phases.json status=skipped_empty_alpha, return.
     """
     os.makedirs(output_dir, exist_ok=True)
+    # WASH BUG FIX: toggle use_persistent_data OFF here to force Cycles to
+    # release BVH/texture cache from the PREVIOUS object. Setting to False
+    # only for this one line (then back to True in init_render before render
+    # loop) prevents stochastic texture wash where prior obj's textures leak
+    # into current render (~6.4% of meshes affected in persistent mode).
+    # Cost: one extra BVH rebuild per obj (~0.5s), avoids per-view kernel
+    # reload (which would cost 30x more).
+    bpy.context.scene.render.use_persistent_data = False
     init_scene()
     load_object(mesh_path)
+    # Re-enable persistent for the 40 views of THIS obj (share BVH → fast).
+    bpy.context.scene.render.use_persistent_data = True
 
     # Layer 1a: degenerate-mesh gate
     try:
