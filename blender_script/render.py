@@ -66,7 +66,12 @@ def init_render(engine="CYCLES", resolution=512, device="GPU", samples=128,
     bpy.context.scene.render.use_persistent_data = True  # share BVH across frames of same obj
 
     bpy.context.scene.cycles.samples = samples if not geo_mode else 1
-    bpy.context.scene.cycles.filter_type = "BOX"
+    # Blender 4.5+ renamed `filter_type` → `pixel_filter_type` (breaking change).
+    # Both 4.5 and 5.2 use `pixel_filter_type`. Fall back for 4.2.9.
+    if hasattr(bpy.context.scene.cycles, 'pixel_filter_type'):
+        bpy.context.scene.cycles.pixel_filter_type = "BOX"
+    else:
+        bpy.context.scene.cycles.filter_type = "BOX"
     bpy.context.scene.cycles.filter_width = 1
     bpy.context.scene.cycles.diffuse_bounces = 1
     bpy.context.scene.cycles.glossy_bounces = 1
@@ -117,13 +122,30 @@ def init_nodes(save_depth=True, base_path=""):
         depth_file_output.format.file_format = "PNG"
         depth_file_output.format.color_depth = "16"
         depth_file_output.format.color_mode = "BW"
-        depth_map = nodes.new(type="CompositorNodeMapRange")
-        depth_map.inputs[1].default_value = 0
-        depth_map.inputs[2].default_value = 10
-        depth_map.inputs[3].default_value = 0
-        depth_map.inputs[4].default_value = 1
-        links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
-        links.new(depth_map.outputs[0], depth_file_output.inputs[0])
+        # Blender 5.2 removed CompositorNodeMapRange. Emulate with two Math
+        # nodes: (depth - from_min) / (from_max - from_min). Both 4.5 and 4.2
+        # still support MapRange as a single node.
+        if hasattr(bpy.types, 'CompositorNodeMapRange'):
+            depth_map = nodes.new(type="CompositorNodeMapRange")
+            depth_map.inputs[1].default_value = 0
+            depth_map.inputs[2].default_value = 10
+            depth_map.inputs[3].default_value = 0
+            depth_map.inputs[4].default_value = 1
+            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+            links.new(depth_map.outputs[0], depth_file_output.inputs[0])
+        else:
+            # 5.2 fallback: subtract + divide
+            depth_map = nodes.new(type="CompositorNodeMath")
+            depth_map.operation = 'SUBTRACT'
+            depth_map.inputs[1].default_value = 0  # from_min
+            depth_div = nodes.new(type="CompositorNodeMath")
+            depth_div.operation = 'DIVIDE'
+            depth_div.inputs[1].default_value = 10  # from_max - from_min
+            depth_div.use_clamp = True
+            links.new(render_layers.outputs["Depth"], depth_map.inputs[0])
+            links.new(depth_map.outputs[0], depth_div.inputs[0])
+            links.new(depth_div.outputs[0], depth_file_output.inputs[0])
+            spec_nodes["depth_div"] = depth_div  # so per-frame update can reach it
         outputs["depth"] = depth_file_output
         spec_nodes["depth_map"] = depth_map
     return outputs, spec_nodes
@@ -578,8 +600,17 @@ def render_one_object(mesh_path: str, output_dir: str, views: list,
         cam.data.lens = 16.0 / math.tan(fov / 2.0)
 
         # Depth MapRange — depth bounds per frame (TRELLIS formula adapted to per-view radius)
-        spec_nodes["depth_map"].inputs[1].default_value = radius - 0.5 * math.sqrt(3)
-        spec_nodes["depth_map"].inputs[2].default_value = radius + 0.5 * math.sqrt(3)
+        # 4.2/4.5 use single MapRange node; 5.2 uses (Subtract + Divide) two-node emulation.
+        d_min = radius - 0.5 * math.sqrt(3)
+        d_max = radius + 0.5 * math.sqrt(3)
+        if "depth_div" in spec_nodes:
+            # 5.2 path: from_min goes to Subtract input[1], scale goes to Divide input[1]
+            spec_nodes["depth_map"].inputs[1].default_value = d_min
+            spec_nodes["depth_div"].inputs[1].default_value = (d_max - d_min)
+        else:
+            # 4.2/4.5 path: MapRange has 4 numeric inputs (from_min/max, to_min/max)
+            spec_nodes["depth_map"].inputs[1].default_value = d_min
+            spec_nodes["depth_map"].inputs[2].default_value = d_max
 
         # Output paths
         # RGB: absolute path works for scene.render.filepath
